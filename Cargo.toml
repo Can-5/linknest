@@ -1,0 +1,13 @@
+[package]
+name = "linknest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local-first bookmark domain engine for Orbit: URL normalization, dedup, markdown/HTML export. No network access, no browser hooks."
+repository = "https://github.com/Can-5/linknest"
+keywords = ["bookmarks", "bookmark-manager", "orbit"]
+categories = ["utilities"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
