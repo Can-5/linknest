@@ -151,6 +151,120 @@ pub fn search<'a>(bookmarks: &'a [Bookmark], query: &str) -> Vec<&'a Bookmark> {
         .collect()
 }
 
+/// Import bookmarks from a Netscape Bookmark HTML export (Firefox/Chromium flavor).
+/// Each `<DT><A ...>title</A>` line is parsed: `HREF` is required (lines without it are
+/// skipped), `ADD_DATE` is read as seconds and converted to `created_at_ms`, and `TAGS`
+/// (comma-separated) becomes the tag list. Ids are `import-{i}` with `i` the 0-based
+/// index of the parsed bookmark. Unknown closing tags are tolerated; unknown entities
+/// pass through untouched. Nothing here makes network requests.
+pub fn import_netscape(export: &str) -> Vec<Bookmark> {
+    let mut out = Vec::new();
+    for raw_line in export.lines() {
+        let line = raw_line.trim();
+        let lower = line.to_ascii_lowercase();
+        let Some(a_start) = lower.find("<a ") else { continue };
+        let rest = &line[a_start + 3..];
+        let Some(gt) = rest.find('>') else { continue };
+        let attrs = &rest[..gt];
+        let after = &rest[gt + 1..];
+
+        let Some(url) = html_attr(attrs, "href") else { continue };
+        if url.trim().is_empty() {
+            continue;
+        }
+        let created_at_ms = html_attr(attrs, "add_date")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|secs| secs.saturating_mul(1000))
+            .unwrap_or(0);
+        let tags: Vec<String> = html_attr(attrs, "tags")
+            .map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+            .unwrap_or_default();
+
+        let lower_after = after.to_ascii_lowercase();
+        let title_raw = match lower_after.find("</") {
+            Some(end) => &after[..end],
+            None => after,
+        };
+        let title = html_unescape(title_raw.trim());
+
+        let i = out.len();
+        let mut b = Bookmark::new(format!("import-{i}"), html_unescape(&url), title, created_at_ms);
+        b.tags = tags;
+        out.push(b);
+    }
+    out
+}
+
+/// Count tag occurrences across bookmarks.
+pub fn tag_counts(bookmarks: &[Bookmark]) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for b in bookmarks {
+        for t in &b.tags {
+            *counts.entry(t.clone()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// Case-insensitive attribute lookup in a tag's attribute string. Values may be
+/// double- or single-quoted. Returns the entity-unescaped value.
+fn html_attr(attrs: &str, key: &str) -> Option<String> {
+    let lower = attrs.to_ascii_lowercase();
+    let key = key.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    loop {
+        let rel = lower[search_from..].find(&key)?;
+        let pos = search_from + rel;
+        let boundary_ok = pos == 0 || matches!(attrs.as_bytes()[pos - 1], b' ' | b'\t' | b'\n' | b'\r');
+        let after_key = lower[pos + key.len()..].trim_start();
+        if boundary_ok && after_key.starts_with('=') {
+            let value_src = &attrs[pos + key.len()..];
+            let value = value_src.trim_start();
+            let value = value.strip_prefix('=').unwrap_or(value).trim_start();
+            let mut chars = value.chars();
+            match chars.next() {
+                Some(q @ ('"' | '\'')) => {
+                    let body = &value[q.len_utf8()..];
+                    let end = body.find(q)?;
+                    return Some(html_unescape(&body[..end]));
+                }
+                _ => return None, // unquoted values are not accepted in bookmark exports
+            }
+        }
+        search_from = pos + key.len();
+    }
+}
+
+/// Single-pass entity unescape for the five named entities used in bookmark exports.
+/// Unknown entities are left untouched (no double-unescaping).
+pub fn html_unescape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        let end = match after.find(';') {
+            Some(e) => e,
+            None => {
+                out.push_str(after);
+                return out;
+            }
+        };
+        let entity = &after[..=end];
+        match entity {
+            "&amp;" => out.push('&'),
+            "&lt;" => out.push('<'),
+            "&gt;" => out.push('>'),
+            "&quot;" => out.push('"'),
+            "&#39;" => out.push('\''),
+            _ => out.push_str(entity),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Export as markdown list. Titles and urls are written literally; markdown-unsafe
 /// characters in titles are backslash-escaped so the output stays valid.
 pub fn export_markdown(bookmarks: &[Bookmark]) -> String {
@@ -267,6 +381,56 @@ mod tests {
         let out = export_html(&[bm("1", "https://x.test/", "<script>alert(1)</script>")]);
         assert!(!out.contains("<script>alert(1)</script>"));
         assert!(out.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn import_netscape_parses_full_line() {
+        let export = r#"<!DOCTYPE NETSCAPE-Bookmark-file-1>
+<DL><p>
+    <DT><A HREF="https://example.com/rust" ADD_DATE="1700000000" TAGS="rust,docs">Rust &amp; Cargo</A>
+    <DT><A HREF="https://example.com/a?b=1&amp;c=2" ADD_DATE="1650000001">Tom &lt;b&gt; &quot;quoted&quot; &#39;x&#39;</A>
+    <DT><A HREF="https://no-date.example.com/">No date</A>
+    <DT><A ADD_DATE="1">No href — skipped</A>
+</DL><p>
+"#;
+        let bms = import_netscape(export);
+        assert_eq!(bms.len(), 3);
+        assert_eq!(bms[0].id, "import-0");
+        assert_eq!(bms[0].url, "https://example.com/rust");
+        assert_eq!(bms[0].title, "Rust & Cargo");
+        assert_eq!(bms[0].tags, vec!["rust".to_string(), "docs".to_string()]);
+        assert_eq!(bms[0].created_at_ms, 1_700_000_000_000);
+        assert_eq!(bms[1].title, "Tom <b> \"quoted\" 'x'");
+        assert_eq!(bms[1].url, "https://example.com/a?b=1&c=2");
+        assert_eq!(bms[1].created_at_ms, 1_650_000_001_000);
+        assert_eq!(bms[2].created_at_ms, 0); // missing ADD_DATE → 0
+        assert_eq!(bms[2].id, "import-2");
+    }
+
+    #[test]
+    fn import_netscape_handles_empty_and_garbage() {
+        assert!(import_netscape("").is_empty());
+        assert!(import_netscape("<html>not a bookmark file</html>").is_empty());
+    }
+
+    #[test]
+    fn html_unescape_single_pass() {
+        assert_eq!(html_unescape("&amp;lt;"), "&lt;"); // no double unescape
+        assert_eq!(html_unescape("plain"), "plain");
+        assert_eq!(html_unescape("&unknown; &amp;"), "&unknown; &");
+        assert_eq!(html_unescape("trailing &"), "trailing &");
+    }
+
+    #[test]
+    fn tag_counts_aggregates() {
+        let mut a = bm("1", "https://a.test/", "A");
+        a.tags = vec!["rust".into(), "docs".into()];
+        let mut b = bm("2", "https://b.test/", "B");
+        b.tags = vec!["rust".into()];
+        let counts = tag_counts(&[a, b, bm("3", "https://c.test/", "C")]);
+        assert_eq!(counts.get("rust"), Some(&2));
+        assert_eq!(counts.get("docs"), Some(&1));
+        assert_eq!(counts.len(), 2);
     }
 
     #[test]
